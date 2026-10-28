@@ -9,7 +9,11 @@ y : patch *width*
 z : substrate thickness (ground plane at z = 0, patch at z = thickness)
 The patch and substrate are centred on the origin.
 """
-from typing import List, Optional
+from beanie import Document
+import socket
+import uuid
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -92,3 +96,44 @@ class SimulationResponse(BaseModel):
     min_s11: float = Field(..., description="Minimum S11 in dB")
     bandwidth_10db: Optional[float] = Field(None, description="Contiguous -10 dB bandwidth around resonance in Hz (None if S11 never < -10 dB)")
     simulation_time_s: float = Field(..., description="Wall-clock solver + post-processing time in seconds")
+
+
+# --------------------------------------------------------------------------- #
+# Record = request + response + metadata (one row in the `simulations` table)
+# --------------------------------------------------------------------------- #
+class SimulationMetadata(BaseModel):
+    run_id: uuid.UUID = Field(default_factory=uuid.uuid4, description="Unique id of this simulation run")
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), description="UTC time the record was created")
+    api_version: Optional[str] = Field(None, description="Version of this server (e.g. app.version)")
+    engine: str = Field("openEMS", description="Simulation engine used")
+    engine_version: Optional[str] = Field(None, description="Engine version, if known")
+    hostname: Optional[str] = Field(default_factory=socket.gethostname, description="Machine that ran the simulation")
+    notes: Optional[str] = Field(None, description="Free-form notes")
+
+
+class SimulationRecord(BaseModel):
+    """Bundles the request, the response and metadata into one storable unit."""
+
+    request: SimulationRequest
+    response: SimulationResponse
+    metadata: SimulationMetadata = Field(default_factory=SimulationMetadata)
+
+    @classmethod
+    def from_run(cls, request: SimulationRequest, response: SimulationResponse, **metadata: Any) -> "SimulationRecord":
+        """Build a record, e.g. SimulationRecord.from_run(req, res, api_version="2.0.0")."""
+        return cls(request=request, response=response, metadata=SimulationMetadata(**metadata))
+
+    def to_row(self) -> Dict[str, Any]:
+        """Flat dict whose keys match the columns of the `simulations` table."""
+        row: Dict[str, Any] = {}
+        for group, values in self.request.model_dump().items():
+            prefix = "freq" if group == "frequency" else group  # frequency.start -> freq_start
+            for key, value in values.items():
+                row[f"{prefix}_{key}"] = value
+        row.update(self.response.model_dump())
+        row.update(self.metadata.model_dump())
+        return row
+    class Settings :
+        name = "patch_antenna_simulations"
+
+

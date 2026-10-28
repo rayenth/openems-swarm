@@ -1,17 +1,38 @@
 import tempfile
+import traceback
 import time
 from typing import Optional
 
 import numpy as np
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+import asyncio
+
 
 from CSXCAD import ContinuousStructure
 from openEMS import openEMS
 from openEMS.physical_constants import C0, EPS0
 
-from schemas import SimulationRequest, SimulationResponse
+from schemas import SimulationRequest, SimulationResponse, SimulationRecord, SimulationMetadata
 
-app = FastAPI(title="openEMS FDTD Simulation Server", version="2.0.0")
+from beanie import init_beanie
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+from motor.motor_asyncio import AsyncIOMotorClient
+
+
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+  # --- STARTUP LOGIC ---
+  client = AsyncIOMotorClient("mongodb://localhost:27017")
+  app.state.db = client.antenna_optimization_db
+  yield
+  client.close()
+  print("MongoDB connection closed.")
+
+app = FastAPI(title="openEMS FDTD Simulation Server", version="2.0.0", lifespan=lifespan)
+
 
 UNIT = 1e-3  # all geometry is handled in millimetres
 
@@ -32,7 +53,7 @@ def _bandwidth(freq: np.ndarray, s11_db: np.ndarray, idx: int, threshold: float 
     return float(freq[hi] - freq[lo])
 
 
-def _simulate(req: SimulationRequest, sim_path: str) -> SimulationResponse:
+async def _simulate(req: SimulationRequest, sim_path: str, db) -> SimulationResponse:
     t0 = time.time()
     p, s, f, fr, sv = req.patch, req.substrate, req.feed, req.frequency, req.solver
 
@@ -110,7 +131,7 @@ def _simulate(req: SimulationRequest, sim_path: str) -> SimulationResponse:
     s11_db = 20 * np.log10(np.maximum(np.abs(s11), 1e-12))
 
     idx = int(np.argmin(s11_db))
-    return SimulationResponse(
+    response = SimulationResponse(
         status="success",
         frequencies=freq.tolist(),
         s11_db=s11_db.tolist(),
@@ -121,6 +142,11 @@ def _simulate(req: SimulationRequest, sim_path: str) -> SimulationResponse:
         bandwidth_10db=_bandwidth(freq, s11_db, idx),
         simulation_time_s=time.time() - t0,
     )
+    print ("\n hello \n")
+    record = SimulationRecord(request= req , response=response)
+    
+    await db.antenna_simulations.insert_one(record.model_dump(mode="json"))
+    return response
 
 
 @app.get("/health")
@@ -130,12 +156,18 @@ def health():
 
 # Plain `def` so FastAPI runs the blocking solver in its threadpool.
 @app.post("/simulate", response_model=SimulationResponse)
-def run_simulation(payload: SimulationRequest):
+async def run_simulation(payload: SimulationRequest, request : Request):
+    db = request.app.state.db
     # Isolated temp directory per request avoids race conditions between runs
     with tempfile.TemporaryDirectory() as sim_path:
         try:
-            return _simulate(payload, sim_path)
+            response = await _simulate(payload, sim_path, db)
+            return response
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
         except Exception as e:
+            error_trace = traceback.format_exc()
+            print("--- CRASH TRACEBACK ---")
+            print(error_trace)
+            print("-----------------------")
             raise HTTPException(status_code=500, detail=str(e))
